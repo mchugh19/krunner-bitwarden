@@ -1,0 +1,19 @@
+[Desktop Entry]
+Name=Bitwarden
+Comment=Search your Bitwarden vault from KRunner
+Type=Service
+Icon=password-vault
+X-KDE-ServiceTypes=Plasma/Runner
+X-KDE-PluginInfo-Author=ccarpo
+X-KDE-PluginInfo-Email=
+X-KDE-PluginInfo-Name=bitwarden
+X-KDE-PluginInfo-Version=1.1.0
+X-KDE-PluginInfo-License=MIT
+X-KDE-PluginInfo-EnabledByDefault=true
+X-Plasma-API=DBus
+X-Plasma-DBusRunner-Service=org.kde.krunner.bitwarden
+X-Plasma-DBusRunner-Path=/runner
+X-Plasma-Runner-Min-Letter-Count=2
+X-Plasma-Request-Actions-Once=true
+X-Plasma-Runner-Syntaxes=:q:,bw :q:
+X-Plasma-Runner-Syntax-Descriptions=Search Bitwarden vault for credentials,Search Bitwarden vault with bw prefix

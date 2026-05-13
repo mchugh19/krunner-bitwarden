@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# install.sh — installs krunner-bitwarden for the current user
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+INSTALL_DIR="$HOME/.local/share/krunner-bitwarden"
+SERVICE_DIR="$HOME/.config/systemd/user"
+CONFIG_DIR="$HOME/.config/krunner-bitwarden"
+
+# Plasma 6 uses krunner/dbusplugins; Plasma 5 uses kservices5
+if plasmashell --version 2>/dev/null | grep -q '^plasmashell 6'; then
+    DESKTOP_DIR="$HOME/.local/share/krunner/dbusplugins"
+else
+    DESKTOP_DIR="$HOME/.local/share/kservices5"
+fi
+
+echo "Installing krunner-bitwarden…"
+
+# ── 1. Copy plugin files ──────────────────────────────────────────────────────
+mkdir -p "$INSTALL_DIR"
+cp "$SCRIPT_DIR/bitwarden_runner.py"        "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/bitwarden_unlock_helper.py" "$INSTALL_DIR/"
+chmod +x "$INSTALL_DIR/bitwarden_runner.py"
+chmod +x "$INSTALL_DIR/bitwarden_unlock_helper.py"
+
+# ── 2. Install .desktop file ──────────────────────────────────────────────────
+mkdir -p "$DESKTOP_DIR"
+cp "$SCRIPT_DIR/plasma-runner-bitwarden.desktop" "$DESKTOP_DIR/"
+echo "Desktop file installed to $DESKTOP_DIR"
+
+# ── 3. Install systemd service ────────────────────────────────────────────────
+mkdir -p "$SERVICE_DIR"
+
+# Rewrite ExecStart to use the actual install dir
+sed "s|%h/.local/share/krunner-bitwarden|$INSTALL_DIR|g" \
+    "$SCRIPT_DIR/krunner-bitwarden.service" \
+    > "$SERVICE_DIR/krunner-bitwarden.service"
+
+echo "Systemd service installed to $SERVICE_DIR"
+
+# ── 4. Install default config (do NOT overwrite existing one) ─────────────────
+if [ ! -f "$CONFIG_DIR/config.ini" ]; then
+    mkdir -p "$CONFIG_DIR"
+    cp "$SCRIPT_DIR/config.ini" "$CONFIG_DIR/config.ini"
+    echo "Default config installed to $CONFIG_DIR/config.ini"
+else
+    echo "Existing config found at $CONFIG_DIR/config.ini — not overwriting"
+fi
+
+# ── 5. Enable and start the service ──────────────────────────────────────────
+systemctl --user daemon-reload
+systemctl --user enable --now krunner-bitwarden.service
+echo "Service enabled and started"
+
+# ── 6. Enable plugin in krunnerrc ────────────────────────────────────────────
+if command -v kwriteconfig6 &>/dev/null; then
+    kwriteconfig6 --file krunnerrc --group Plugins --key bitwardenEnabled true
+elif command -v kwriteconfig5 &>/dev/null; then
+    kwriteconfig5 --file krunnerrc --group Plugins --key bitwardenEnabled true
+fi
+
+# ── 7. Rebuild KRunner service cache and restart KRunner ─────────────────────
+if command -v kbuildsycoca6 &>/dev/null; then
+    kbuildsycoca6 --noincremental 2>/dev/null || true
+elif command -v kbuildsycoca5 &>/dev/null; then
+    kbuildsycoca5 --noincremental 2>/dev/null || true
+fi
+
+# Restart KRunner so it picks up the new runner
+kquitapp6 krunner 2>/dev/null || kquitapp5 krunner 2>/dev/null || true
+sleep 1
+(kstart6 krunner &>/dev/null || kstart5 krunner &>/dev/null || true) &
+
+echo ""
+echo "Installation complete!"
+echo "Open KRunner (Alt+Space) and search for 'Bitwarden' or type any credential name."
+echo ""
+echo "To configure, edit: $CONFIG_DIR/config.ini"
+echo "Then restart the service:  systemctl --user restart krunner-bitwarden"
