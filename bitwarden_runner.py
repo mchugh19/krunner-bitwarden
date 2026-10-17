@@ -1,42 +1,56 @@
 #!/usr/bin/env python3
-"""KRunner plugin for Bitwarden — searches the bw serve API and copies credentials."""
+"""KRunner plugin for Bitwarden. Searches the vault via the rbw CLI and copies credentials.
+
+Backend: rbw (https://github.com/doy/rbw), the unofficial Bitwarden CLI.
+rbw has no HTTP API. Its background agent (rbw-agent) holds the vault keys
+in memory, and every operation here is a short-lived `rbw` subprocess call:
+
+    rbw list --raw            all entries as JSON (id, name, user, uris, type)
+    rbw get <id>              password for an entry (UUID accepted as the name)
+    rbw get --field <f> <id>  a single field (username, uris, ...)
+    rbw code <id>             current TOTP code for an entry
+    rbw generate <len> ...    generate a password (no name = print only, not saved)
+    rbw unlock / rbw lock     unlock (prompts via pinentry) / lock the vault
+    rbw unlocked              exit status 0 if and only if the vault is unlocked
+    rbw sync                  refresh the local vault copy
+    rbw stop-agent            stop rbw-agent (also locks the vault)
+
+Unlocking is done by rbw-agent through its configured pinentry program.
+This plugin never sees, stores, or passes the master password.
+"""
 
 import configparser
 import json
 import os
 import signal
 import subprocess
-import time
 import threading
-import urllib.error
-import urllib.parse
-import urllib.request
 
 import dbus
 import dbus.service
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 
-# ── DBus identifiers ─────────────────────────────────────────────────────────
+# -- DBus identifiers ---------------------------------------------------------
 BUS_NAME = "org.kde.krunner.bitwarden"
 OBJ_PATH = "/runner"
 IFACE = "org.kde.krunner1"
 
-# ── Match types (mirrors Plasma::QueryType) ───────────────────────────────────
-# categoryRelevance values — mirror KRunner::QueryMatch::CategoryRelevance enum
+# -- Match types (mirrors Plasma::QueryType) ----------------------------------
+# categoryRelevance values, mirror KRunner::QueryMatch::CategoryRelevance enum
 CATEGORY_LOWEST = 0
 CATEGORY_LOW = 30
 CATEGORY_MODERATE = 50
 CATEGORY_HIGH = 70
 CATEGORY_HIGHEST = 100
 
-# ── Action IDs ────────────────────────────────────────────────────────────────
+# -- Action IDs ---------------------------------------------------------------
 ACTION_COPY_PASSWORD = ""          # primary / default
 ACTION_COPY_USERNAME = "copy_username"
 ACTION_COPY_TOTP = "copy_totp"
 ACTION_OPEN_URL = "open_url"
 
-# ── Config defaults ───────────────────────────────────────────────────────────
+# -- Config defaults ----------------------------------------------------------
 CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
     "krunner-bitwarden",
@@ -45,20 +59,26 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.ini")
 
 DEFAULTS = {
     "bitwarden": {
-        "credential_retrieval": "dynamic",
-        "bitwarden_api": "http://localhost:8087",
-        "bw_executable_path": "bw",
-        "auto_start_server": "true",
-        "unlock_method": "prompt",
-        "unlock_password_file": "",
-        "unlock_password_env": "BW_MASTER_PASS",
+        # Empty means: use `rbw` from PATH.
+        "rbw_executable_path": "",
+        # Empty means: rbw's default profile. Sets RBW_PROFILE when given.
+        "rbw_profile": "",
     }
 }
 
 ICON = "password-vault"
 
+# rbw entry types that are not logins. `rbw list --raw` reports the type as a
+# string (older/other builds may omit it); anything not in this set, and a
+# missing type, is treated as a login so a spelling difference in rbw's type
+# names cannot silently hide every credential.
+NON_LOGIN_TYPES = {
+    "card", "creditcard", "identity", "note", "securenote", "secure note",
+    "sshkey", "ssh key", "ssh",
+}
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+# -----------------------------------------------------------------------------
 
 class BitwardenRunner(dbus.service.Object):
 
@@ -69,30 +89,27 @@ class BitwardenRunner(dbus.service.Object):
         bus_name = dbus.service.BusName(BUS_NAME, bus=session_bus)
         dbus.service.Object.__init__(self, bus_name, OBJ_PATH)
 
-        # runtime state
-        self._server_process = None
+        # Runtime state. The match cache deliberately holds no secrets:
+        # rbw list returns no passwords, so Run() fetches the password,
+        # TOTP code, etc. from rbw at action time.
         self._generator_presets = []
-        self._match_cache = {}  # item_id -> payload dict, populated by last Match()
+        self._match_cache = {}  # item_id -> {"name", "username", "uris"}
+        self._rbw_not_found = False
 
         self._load_config()
         self._load_generator_presets()
+        # No server to start and nothing to unlock here: rbw-agent starts
+        # on first use and owns the vault state and lock timeout.
 
-        if self.auto_start_server:
-            if not self._is_server_running():
-                self._start_server()
-            if self.unlock_method not in ("none", "prompt"):
-                self._auto_unlock()
-
-    # ── Config ────────────────────────────────────────────────────────────────
+    # -- Config ---------------------------------------------------------------
 
     def _load_config(self):
         cfg = configparser.ConfigParser()
 
-        # write defaults if file absent
+        # Write defaults if file absent
         if not os.path.exists(CONFIG_FILE):
             os.makedirs(CONFIG_DIR, exist_ok=True)
             cfg.read_dict(DEFAULTS)
-            # write generator presets
             cfg["generator.default"] = {
                 "type": "password", "length": "16",
                 "uppercase": "true", "lowercase": "true",
@@ -120,13 +137,16 @@ class BitwardenRunner(dbus.service.Object):
 
         bw = cfg["bitwarden"] if "bitwarden" in cfg else {}
 
-        self.credential_retrieval = bw.get("credential_retrieval", "dynamic")
-        self.api_url = bw.get("bitwarden_api", "http://localhost:8087").rstrip("/")
-        self.bw_exe = bw.get("bw_executable_path", "bw") or "bw"
-        self.auto_start_server = bw.get("auto_start_server", "true").lower() == "true"
-        self.unlock_method = bw.get("unlock_method", "prompt")
-        self.unlock_password_file = bw.get("unlock_password_file", "")
-        self.unlock_password_env = bw.get("unlock_password_env", "BW_MASTER_PASS")
+        # Legacy alias from the bw-serve version of this plugin:
+        # bw_executable_path was its name for the CLI path. The literal
+        # default "bw" from old configs means "unset", not the rbw path.
+        legacy_exe = bw.get("bw_executable_path", "")
+        if legacy_exe == "bw":
+            legacy_exe = ""
+        self.rbw_exe = (
+            bw.get("rbw_executable_path", "") or legacy_exe or "rbw"
+        )
+        self.rbw_profile = bw.get("rbw_profile", "")
 
         self._cfg = cfg  # keep for preset parsing
 
@@ -157,7 +177,116 @@ class BitwardenRunner(dbus.service.Object):
                 }
             self._generator_presets.append(preset)
 
-    # ── KRunner DBus interface ────────────────────────────────────────────────
+    # -- rbw subprocess plumbing ----------------------------------------------
+
+    def _rbw_env(self):
+        env = dict(os.environ)
+        if self.rbw_profile:
+            env["RBW_PROFILE"] = self.rbw_profile
+        return env
+
+    def _run_rbw(self, args, timeout=10):
+        """Run rbw, return the CompletedProcess, or None on spawn/timeout error."""
+        try:
+            return subprocess.run(
+                [self.rbw_exe] + list(args),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                env=self._rbw_env(),
+            )
+        except FileNotFoundError:
+            self._rbw_not_found = True
+            print(f"[bitwarden] rbw executable not found: {self.rbw_exe}", flush=True)
+            return None
+        except subprocess.TimeoutExpired:
+            print(f"[bitwarden] rbw timed out: {' '.join(args)}", flush=True)
+            return None
+        except Exception as exc:
+            print(f"[bitwarden] rbw error ({' '.join(args)}): {exc}", flush=True)
+            return None
+
+    def _rbw_output(self, args, timeout=10):
+        """Run rbw and return stdout as text, without its trailing newline."""
+        proc = self._run_rbw(args, timeout=timeout)
+        if proc is None or proc.returncode != 0:
+            if proc is not None and proc.stderr:
+                first = proc.stderr.decode(errors="replace").strip().splitlines()
+                if first:
+                    print(f"[bitwarden] rbw {' '.join(args)}: {first[0]}", flush=True)
+            return ""
+        out = proc.stdout.decode(errors="replace")
+        # Strip exactly the trailing newline rbw println adds. Passwords
+        # ending in other whitespace must survive untouched.
+        if out.endswith("\n"):
+            out = out[:-1]
+            if out.endswith("\r"):
+                out = out[:-1]
+        return out
+
+    def _vault_state(self) -> str:
+        """One of: "unlocked", "locked", "missing"."""
+        if self._rbw_not_found:
+            return "missing"
+        proc = self._run_rbw(["unlocked"], timeout=5)
+        if proc is None:
+            return "missing" if self._rbw_not_found else "locked"
+        # Current rbw has `rbw unlocked` (exit 0 = unlocked). Very old rbw
+        # rejects the subcommand; report locked rather than guess unlocked,
+        # because searching a locked vault would fire a pinentry prompt
+        # from inside Match(), which runs on every keystroke.
+        return "unlocked" if proc.returncode == 0 else "locked"
+
+    def _list_items(self):
+        """All vault entries from `rbw list --raw`, normalised to dicts.
+
+        Raw entries look like:
+            {"id": "<uuid>", "name": "...", "user": "..." or null,
+             "folder": "..." or null, "uris": ["https://..."] or null,
+             "type": "login" or null}
+        Only call this when the vault is unlocked (see Match); rbw would
+        otherwise try to unlock via pinentry from inside the search path.
+        """
+        proc = self._run_rbw(["list", "--raw"], timeout=10)
+        if proc is None or proc.returncode != 0:
+            if proc is not None and proc.stderr:
+                first = proc.stderr.decode(errors="replace").strip().splitlines()
+                if first:
+                    print(f"[bitwarden] rbw list: {first[0]}", flush=True)
+            return []
+        try:
+            raw_items = json.loads(proc.stdout.decode(errors="replace"))
+        except Exception as exc:
+            print(f"[bitwarden] Cannot parse rbw list output: {exc}", flush=True)
+            return []
+
+        items = []
+        for raw in raw_items if isinstance(raw_items, list) else []:
+            if not isinstance(raw, dict) or not raw.get("id"):
+                continue
+            entry_type = str(raw.get("type") or "").strip().lower()
+            if entry_type in NON_LOGIN_TYPES:
+                continue
+            uris = []
+            for uri in raw.get("uris") or []:
+                if isinstance(uri, str):
+                    uris.append(uri)
+                elif isinstance(uri, dict) and uri.get("uri"):
+                    uris.append(uri["uri"])
+            items.append({
+                "id": raw["id"],
+                "name": raw.get("name") or "",
+                # `rbw list` calls the field "user"; `rbw get --raw` uses
+                # "username" inside its data object. Accept both.
+                "username": raw.get("user") or raw.get("username") or "",
+                "uris": uris,
+            })
+        return items
+
+    def _get_field(self, item_id: str, field: str) -> str:
+        return self._rbw_output(["get", "--field", field, item_id])
+
+    # -- KRunner DBus interface -------------------------------------------------
 
     @dbus.service.method(IFACE, out_signature="a(sss)")
     def Actions(self):
@@ -172,53 +301,58 @@ class BitwardenRunner(dbus.service.Object):
         query = query.strip()
         matches = []
 
-        server_running = self._is_server_running()
-        vault_locked = self._is_vault_locked() if server_running else False
+        state = self._vault_state()
+        rbw_available = state != "missing"
+        vault_locked = state != "unlocked"
 
-        # ── Management commands ───────────────────────────────────────────────
+        # -- Management commands ------------------------------------------------
         q_lower = query.lower()
 
         # Status
         if "bitwarden" in q_lower or "bw status" in q_lower or query == "":
-            if server_running:
-                vault_status = "LOCKED" if vault_locked else "UNLOCKED"
-                desc = f"Server running — vault {vault_status}"
+            if not rbw_available:
+                desc = "rbw not found (set rbw_executable_path in config.ini)"
+            elif vault_locked:
+                desc = "Vault LOCKED"
             else:
-                desc = "Server not running"
+                desc = "Vault UNLOCKED"
             matches.append((
                 "cmd:status", f"Bitwarden Status: {desc}", ICON,
                 CATEGORY_LOWEST, 0.5, {"subtext": desc, "category": "Bitwarden"}
             ))
 
         # Lock
-        if server_running and not vault_locked and (
+        if rbw_available and not vault_locked and (
                 "lock" in q_lower or "bitwarden" in q_lower):
             matches.append((
                 "cmd:lock", "Lock Bitwarden", ICON,
-                CATEGORY_MODERATE, 0.6, {"subtext": "Lock the vault immediately", "category": "Bitwarden"}
+                CATEGORY_MODERATE, 0.6, {"subtext": "Lock the vault immediately (rbw lock)", "category": "Bitwarden"}
             ))
 
-        # Unlock
-        if server_running and vault_locked and (
+        # Unlock. rbw prompts through pinentry, so no terminal helper and
+        # no password handling in this plugin.
+        if rbw_available and vault_locked and (
                 "unlock" in q_lower or "bitwarden" in q_lower or "password" in q_lower):
             matches.append((
-                "cmd:unlock_prompt", "Unlock Bitwarden", ICON,
+                "cmd:unlock", "Unlock Bitwarden", ICON,
                 CATEGORY_HIGH, 0.9,
-                {"subtext": "Press Enter to open unlock dialog", "category": "Bitwarden"}
+                {"subtext": "Press Enter to unlock (rbw pinentry prompt)", "category": "Bitwarden"}
             ))
 
-        # Start / Stop server
-        if not server_running and (
-                "start" in q_lower or "bitwarden" in q_lower or "server" in q_lower):
+        # Sync
+        if rbw_available and not vault_locked and (
+                "sync" in q_lower or "bitwarden" in q_lower):
             matches.append((
-                "cmd:start_server", "Start Bitwarden Server", ICON,
-                CATEGORY_MODERATE, 0.6, {"subtext": "Start bw serve API server", "category": "Bitwarden"}
+                "cmd:sync", "Sync Bitwarden Vault", ICON,
+                CATEGORY_LOWEST, 0.4, {"subtext": "Refresh the local vault copy (rbw sync)", "category": "Bitwarden"}
             ))
-        if server_running and (
-                "stop" in q_lower or "bitwarden" in q_lower or "server" in q_lower):
+
+        # Stop agent
+        if rbw_available and not vault_locked and (
+                "stop" in q_lower or "agent" in q_lower):
             matches.append((
-                "cmd:stop_server", "Stop Bitwarden Server", ICON,
-                CATEGORY_LOWEST, 0.4, {"subtext": "Stop bw serve API server", "category": "Bitwarden"}
+                "cmd:stop_agent", "Stop rbw Agent", ICON,
+                CATEGORY_LOWEST, 0.4, {"subtext": "Stop rbw-agent, which also locks the vault", "category": "Bitwarden"}
             ))
 
         # Generate password
@@ -232,12 +366,9 @@ class BitwardenRunner(dbus.service.Object):
                     {"subtext": summary, "category": "Bitwarden"}
                 ))
 
-        # ── Credential search ─────────────────────────────────────────────────
-        if len(query) >= 3 and server_running and not vault_locked:
-            tokens = query.split()
-            api_term = tokens[0]          # search API with first token
-            filter_terms = tokens[1:]     # filter results client-side with the rest
-            matches.extend(self._search_credentials(api_term, filter_terms))
+        # -- Credential search ----------------------------------------------------
+        if len(query) >= 3 and rbw_available and not vault_locked:
+            matches.extend(self._search_credentials(query.split()))
 
         return matches
 
@@ -247,49 +378,36 @@ class BitwardenRunner(dbus.service.Object):
             self._run_command(match_id[4:], action_id)
             return
 
-        # credential result — match_id is a Bitwarden item UUID
-        item = self._match_cache.get(match_id)
-        if not item:
-            # fallback: fetch directly from API
-            try:
-                url = f"{self.api_url}/object/item/{match_id}"
-                with urllib.request.urlopen(url, timeout=10) as resp:
-                    data = json.loads(resp.read().decode())
-                item = data.get("data", {})
-            except Exception as exc:
-                print(f"[bitwarden] Run fetch error: {exc}", flush=True)
-                return
-
-        login = item.get("login", {})
+        # Credential result. match_id is the Bitwarden item UUID, which rbw
+        # accepts directly as the entry name for get/code.
+        cached = self._match_cache.get(match_id, {})
 
         if action_id == ACTION_COPY_USERNAME:
-            self._copy(login.get("username", ""))
+            username = cached.get("username") or self._get_field(match_id, "username")
+            self._copy(username)
         elif action_id == ACTION_COPY_TOTP:
-            self._fetch_and_copy_totp(item.get("id", match_id))
+            self._fetch_and_copy_totp(match_id)
         elif action_id == ACTION_OPEN_URL:
-            uris = login.get("uris", [])
-            if uris:
-                url = uris[0].get("uri", "")
-                if url:
-                    subprocess.Popen(["xdg-open", url])
+            uris = cached.get("uris") or self._get_field(match_id, "uris").splitlines()
+            if uris and uris[0]:
+                subprocess.Popen(["xdg-open", uris[0]])
         else:
-            # default: copy password
-            self._copy(login.get("password", ""))
+            # Default: copy password, fetched from rbw at action time.
+            self._copy(self._rbw_output(["get", match_id]))
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    # -- Internal helpers ---------------------------------------------------------
 
     def _run_command(self, cmd: str, _action_id: str):
         if cmd == "status":
             pass  # informational only
         elif cmd == "lock":
             self._lock_vault()
-        elif cmd == "unlock_prompt":
-            # Launch a small terminal-based unlock helper in background
-            self._launch_unlock_dialog()
-        elif cmd == "start_server":
-            self._start_server()
-        elif cmd == "stop_server":
-            self._stop_server()
+        elif cmd == "unlock":
+            self._unlock_vault()
+        elif cmd == "sync":
+            self._sync_vault()
+        elif cmd == "stop_agent":
+            self._stop_agent()
         elif cmd.startswith("generate:"):
             preset_json = cmd[len("generate:"):]
             try:
@@ -300,66 +418,49 @@ class BitwardenRunner(dbus.service.Object):
             except Exception as exc:
                 print(f"[bitwarden] Generate error: {exc}", flush=True)
 
-    def _search_credentials(self, query: str, filter_terms: list = None):
+    def _search_credentials(self, tokens: list):
         matches = []
-        sanitized = urllib.parse.quote(query)
+        if not tokens:
+            return matches
         try:
-            url = f"{self.api_url}/list/object/items?search={sanitized}"
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-            items = data.get("data", {}).get("data", [])
-            cred_items = [it for it in items if it.get("type") == 1]
-            # Client-side filter: all extra tokens must match name or username
-            if filter_terms:
-                def matches_all(item):
-                    haystack = (
-                        (item.get("name") or "") + " " +
-                        (item.get("login", {}).get("username") or "")
-                    ).lower()
-                    return all(t.lower() in haystack for t in filter_terms)
-                cred_items = [it for it in cred_items if matches_all(it)]
+            items = self._list_items()
+            # Multi-token narrowing: every token must appear in the entry's
+            # name, username, or one of its URIs.
+            def matches_all(item):
+                haystack = (
+                    item["name"] + " " + item["username"] + " " +
+                    " ".join(item["uris"])
+                ).lower()
+                return all(t.lower() in haystack for t in tokens)
+
+            cred_items = [it for it in items if matches_all(it)]
             for i, item in enumerate(cred_items):
-                login = item.get("login", {})
-                username = login.get("username") or ""
-                item_id = item.get("id", "")
+                item_id = item["id"]
+                username = item["username"]
                 # Unique relevance per position so KRunner shows all entries
                 relevance = max(0.5, 0.95 - i * 0.02)
-                # Cache payload so Run() can act without re-fetching
-                parsed_payload = {
-                    "id": item_id,
-                    "name": item.get("name", ""),
-                    "login": {
-                        "username": login.get("username", ""),
-                        "password": login.get("password", ""),
-                        "uris": login.get("uris", []),
-                    }
+                # Cache only what Run() needs besides the secret itself.
+                self._match_cache[item_id] = {
+                    "name": item["name"],
+                    "username": username,
+                    "uris": item["uris"],
                 }
-                self._match_cache[item_id] = parsed_payload
                 matches.append((
                     item_id,
-                    item.get("name", ""),
+                    item["name"],
                     ICON,
                     CATEGORY_HIGHEST,
                     relevance,
                     {"subtext": username if username else "no username", "category": "Bitwarden"}
                 ))
-        except urllib.error.HTTPError as exc:
-            if exc.code not in (400, 401, 403):
-                print(f"[bitwarden] Search HTTP error: {exc}", flush=True)
         except Exception as exc:
             print(f"[bitwarden] Search error: {exc}", flush=True)
         return matches
 
     def _fetch_and_copy_totp(self, item_id: str):
-        try:
-            url = f"{self.api_url}/object/totp/{item_id}"
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-            totp = data.get("data", {}).get("data", "")
-            if totp:
-                self._copy(totp)
-        except Exception as exc:
-            print(f"[bitwarden] TOTP error: {exc}", flush=True)
+        totp = self._rbw_output(["code", item_id])
+        if totp:
+            self._copy(totp)
 
     def _copy(self, text: str):
         if not text:
@@ -377,172 +478,70 @@ class BitwardenRunner(dbus.service.Object):
                 continue
         print("[bitwarden] No clipboard tool found (install xclip, xsel, or wl-clipboard)", flush=True)
 
-    def _is_server_running(self) -> bool:
-        try:
-            with urllib.request.urlopen(f"{self.api_url}/status", timeout=3):
-                return True
-        except Exception:
-            return False
-
-    def _get_vault_status(self) -> str:
-        try:
-            with urllib.request.urlopen(f"{self.api_url}/status", timeout=3) as resp:
-                data = json.loads(resp.read().decode())
-            status = data.get("data", {}).get("template", {}).get("status", "").lower()
-            if status in ("locked", "unlocked"):
-                return status
-        except Exception:
-            pass
-        return "unknown"
-
-    def _is_vault_locked(self) -> bool:
-        status = self._get_vault_status()
-        if status == "locked":
-            return True
-        if status == "unlocked":
-            return False
-        try:
-            with urllib.request.urlopen(f"{self.api_url}/list/object/items", timeout=3):
-                return False
-        except urllib.error.HTTPError as exc:
-            return exc.code in (400, 401, 403)
-        except Exception:
-            return True
-
     def _lock_vault(self):
-        try:
-            req = urllib.request.Request(f"{self.api_url}/lock",
-                                         data=b"", method="POST")
-            with urllib.request.urlopen(req, timeout=10):
-                pass
+        proc = self._run_rbw(["lock"], timeout=10)
+        if proc is not None and proc.returncode == 0:
             print("[bitwarden] Vault locked", flush=True)
-        except Exception as exc:
-            print(f"[bitwarden] Lock error: {exc}", flush=True)
 
-    def _unlock_vault(self, password: str):
+    def _unlock_vault(self):
+        # Non-blocking: rbw talks to rbw-agent, which presents the pinentry
+        # prompt. Blocking the DBus Run() call on it would freeze KRunner.
         try:
-            payload = json.dumps({"password": password}).encode()
-            req = urllib.request.Request(f"{self.api_url}/unlock",
-                                         data=payload, method="POST")
-            req.add_header("Content-Type", "application/json")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read().decode())
-            if result.get("success"):
-                time.sleep(0.5)
-                self._sync_vault()
-                print("[bitwarden] Vault unlocked successfully", flush=True)
-            else:
-                print(f"[bitwarden] Unlock failed: {result}", flush=True)
+            subprocess.Popen(
+                [self.rbw_exe, "unlock"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=self._rbw_env(),
+            )
+        except FileNotFoundError:
+            self._rbw_not_found = True
+            print(f"[bitwarden] rbw executable not found: {self.rbw_exe}", flush=True)
         except Exception as exc:
             print(f"[bitwarden] Unlock error: {exc}", flush=True)
 
     def _sync_vault(self):
-        try:
-            req = urllib.request.Request(f"{self.api_url}/sync",
-                                         data=b"", method="POST")
-            with urllib.request.urlopen(req, timeout=30):
-                pass
-        except Exception:
-            pass
+        # Sync can take a while and may need the network; keep it off the
+        # DBus thread.
+        thread = threading.Thread(
+            target=lambda: self._run_rbw(["sync"], timeout=60),
+            daemon=True,
+        )
+        thread.start()
 
-    def _auto_unlock(self):
-        password = None
-        if self.unlock_method == "password_file" and self.unlock_password_file:
-            try:
-                with open(self.unlock_password_file) as f:
-                    password = f.read().strip()
-            except Exception as exc:
-                print(f"[bitwarden] Cannot read password file: {exc}", flush=True)
-                return
-        elif self.unlock_method == "password_env":
-            password = os.environ.get(self.unlock_password_env)
-            if not password:
-                print(f"[bitwarden] Env var {self.unlock_password_env} not set", flush=True)
-                return
-        if password:
-            self._unlock_vault(password)
-
-    def _launch_unlock_dialog(self):
-        """
-        Open a small terminal window so the user can type their master password.
-        The helper script reads stdin and POSTs it to the bw serve API.
-        """
-        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "bitwarden_unlock_helper.py")
-        if not os.path.exists(helper):
-            print("[bitwarden] Unlock helper not found", flush=True)
-            return
-        for term in (
-            ["konsole", "--hide-menubar", "--hide-tabbar", "-e"],
-            ["xterm", "-e"],
-            ["gnome-terminal", "--", "bash", "-c"],
-        ):
-            try:
-                subprocess.Popen(term + [f"python3 {helper} {self.api_url}"],
-                                 stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-                return
-            except FileNotFoundError:
-                continue
-        print("[bitwarden] No terminal emulator found for unlock dialog", flush=True)
-
-    def _start_server(self):
-        try:
-            self._server_process = subprocess.Popen(
-                [self.bw_exe, "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            time.sleep(2)
-            if self._is_server_running():
-                print("[bitwarden] Server started", flush=True)
-            else:
-                print("[bitwarden] Server may not have started", flush=True)
-        except Exception as exc:
-            print(f"[bitwarden] Failed to start server: {exc}", flush=True)
-
-    def _stop_server(self):
-        if self._server_process and self._server_process.poll() is None:
-            self._server_process.terminate()
-            self._server_process = None
-            print("[bitwarden] Server stopped", flush=True)
-            return
-        try:
-            subprocess.run(["pkill", "-f", "bw serve"],
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
-            print("[bitwarden] Server stopped via pkill", flush=True)
-        except Exception as exc:
-            print(f"[bitwarden] Failed to stop server: {exc}", flush=True)
+    def _stop_agent(self):
+        proc = self._run_rbw(["stop-agent"], timeout=10)
+        if proc is not None and proc.returncode == 0:
+            print("[bitwarden] rbw-agent stopped", flush=True)
 
     def _generate_password(self, preset: dict) -> str | None:
+        """Generate with rbw. No entry name is passed, so rbw prints the
+        result instead of saving it to the vault.
+
+        Preset mapping, and its limits (rbw has fewer knobs than bw):
+          passphrase preset  -> rbw generate <words> --diceware
+                                (separator/capitalize/include_number ignored)
+          numbers-only preset -> rbw generate <length> --only-numbers
+          special = false     -> --no-symbols
+          special = true      -> no flag (symbols included)
+          uppercase/lowercase toggles have no rbw equivalent and are ignored.
+        """
         try:
-            params: dict = {}
             if preset["type"] == "passphrase":
-                params["passphrase"] = "true"
-                params["words"] = str(preset.get("words", 3))
-                params["separator"] = preset.get("separator", "-")
-                if preset.get("capitalize"):
-                    params["capitalize"] = "true"
-                if preset.get("include_number"):
-                    params["includeNumber"] = "true"
+                args = ["generate", str(preset.get("words", 3)), "--diceware"]
             else:
-                params["length"] = str(preset.get("length", 16))
-                if preset.get("uppercase", True):
-                    params["uppercase"] = "true"
-                if preset.get("lowercase", True):
-                    params["lowercase"] = "true"
-                if preset.get("numbers", True):
-                    params["number"] = "true"
-                if preset.get("special", False):
-                    params["special"] = "true"
-            query_string = urllib.parse.urlencode(params)
-            url = f"{self.api_url}/generate?{query_string}"
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-            if data.get("success"):
-                return data.get("data", {}).get("data", "")
-            print(f"[bitwarden] Generate failed: {data}", flush=True)
+                args = ["generate", str(preset.get("length", 16))]
+                numbers_only = (
+                    preset.get("numbers", True)
+                    and not preset.get("uppercase", True)
+                    and not preset.get("lowercase", True)
+                    and not preset.get("special", False)
+                )
+                if numbers_only:
+                    args.append("--only-numbers")
+                elif not preset.get("special", False):
+                    args.append("--no-symbols")
+            generated = self._rbw_output(args, timeout=10)
+            return generated or None
         except Exception as exc:
             print(f"[bitwarden] Generate error: {exc}", flush=True)
         return None
@@ -550,40 +549,36 @@ class BitwardenRunner(dbus.service.Object):
     @staticmethod
     def _preset_summary(preset: dict) -> str:
         if preset["type"] == "passphrase":
-            parts = [f"{preset['words']} words", f"sep '{preset['separator']}'"]
-            if preset.get("capitalize"):
-                parts.append("capitalized")
-            if preset.get("include_number"):
-                parts.append("with number")
-        else:
-            parts = [f"{preset['length']} chars"]
-            if preset.get("uppercase"):
-                parts.append("upper")
-            if preset.get("lowercase"):
-                parts.append("lower")
-            if preset.get("numbers"):
-                parts.append("numbers")
-            if preset.get("special"):
-                parts.append("special")
+            # rbw diceware: separator/capitalize/include_number unsupported
+            return f"{preset['words']} words, diceware"
+        parts = [f"{preset['length']} chars"]
+        if preset.get("uppercase"):
+            parts.append("upper")
+        if preset.get("lowercase"):
+            parts.append("lower")
+        if preset.get("numbers"):
+            parts.append("numbers")
+        if preset.get("special"):
+            parts.append("special")
         return " · ".join(parts)
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
+    # -- Main loop ----------------------------------------------------------------
 
     def run(self):
         loop = GLib.MainLoop()
 
         def _sigint(sig, _frame):
-            print("\n[bitwarden] Shutting down…", flush=True)
+            print("\n[bitwarden] Shutting down...", flush=True)
             loop.quit()
 
         signal.signal(signal.SIGINT, _sigint)
         signal.signal(signal.SIGTERM, _sigint)
 
-        print("[bitwarden] KRunner Bitwarden runner started", flush=True)
+        print("[bitwarden] KRunner Bitwarden runner started (rbw backend)", flush=True)
         loop.run()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     runner = BitwardenRunner()
