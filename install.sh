@@ -15,14 +15,33 @@ else
     DESKTOP_DIR="$HOME/.local/share/kservices5"
 fi
 
-echo "Installing krunner-bitwarden…"
+echo "Installing krunner-bitwarden (rbw backend)..."
+
+# ── 0. Check for rbw ──────────────────────────────────────────────────────────
+# The plugin shells out to rbw for every vault operation. It still installs
+# without it, but cannot do anything until rbw is present and configured
+# (rbw config set email <you@example.com>, then rbw login / rbw register).
+if ! command -v rbw &>/dev/null; then
+    echo "WARNING: rbw not found in PATH. Install rbw first, e.g.:"
+    echo "  Fedora:  sudo dnf install rbw"
+    echo "  Arch:    sudo pacman -S rbw"
+    echo "  Other:   cargo install --locked rbw"
+    echo ""
+fi
+# Unlock prompts come from rbw-agent via pinentry. Under a systemd user
+# service there is no TTY, so the pinentry must be a GUI one.
+if command -v rbw &>/dev/null && ! rbw config show 2>/dev/null | grep -qi '^pinentry.*qt\|^pinentry.*gtk\|^pinentry.*gnome\|^pinentry.*gui'; then
+    echo "Tip: make sure rbw uses a GUI pinentry, e.g.:"
+    echo "  rbw config set pinentry pinentry-qt"
+    echo ""
+fi
 
 # ── 1. Copy plugin files ──────────────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/bitwarden_runner.py"        "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/bitwarden_unlock_helper.py" "$INSTALL_DIR/"
 chmod +x "$INSTALL_DIR/bitwarden_runner.py"
-chmod +x "$INSTALL_DIR/bitwarden_unlock_helper.py"
+# Remove the unlock helper left by the previous (bw serve) version, if any
+rm -f "$INSTALL_DIR/bitwarden_unlock_helper.py"
 
 # ── 2. Install .desktop file ──────────────────────────────────────────────────
 mkdir -p "$DESKTOP_DIR"
@@ -75,6 +94,8 @@ sleep 1
 echo ""
 echo "Installation complete!"
 echo "Open KRunner (Alt+Space) and search for 'Bitwarden' or type any credential name."
+echo "On first use the vault will be locked: search 'unlock bitwarden' and press Enter,"
+echo "then enter your master password in the rbw pinentry prompt."
 echo ""
 echo "To configure, edit: $CONFIG_DIR/config.ini"
 echo "Then restart the service:  systemctl --user restart krunner-bitwarden"

@@ -2,6 +2,27 @@
 
 All notable changes to krunner-bitwarden are documented here.
 
+## [1.2.0-rbw1] — 2026-10-17
+
+Fork: backend switched from the official Bitwarden CLI to rbw.
+
+### Changed
+- All vault operations now go through the `rbw` CLI (github.com/doy/rbw) as subprocess calls: `rbw list --raw` for search, `rbw get` / `rbw get --field` / `rbw code` for actions, `rbw generate` for the generator, `rbw lock` / `rbw unlock` / `rbw sync` / `rbw unlocked` / `rbw stop-agent` for vault management. The official `bw` CLI is no longer required.
+- Config: `rbw_executable_path` and `rbw_profile` replace `bitwarden_api`, `bw_executable_path` (still honoured as a legacy alias), `auto_start_server`, and the unlock settings. Existing generator presets are unchanged.
+
+### Removed
+- The `bw serve` HTTP API, the plugin's server start/stop management, and the systemd service's role in running it. The service now runs only the plugin; `rbw-agent` is started by rbw itself.
+- `bitwarden_unlock_helper.py` and all master-password handling: the `password_file` and `password_env` auto-unlock methods are gone. Unlocking is done by `rbw-agent` through its configured pinentry program.
+
+### Added
+- Security: the match cache no longer holds passwords. `rbw list` returns no secrets, and passwords/TOTP codes are fetched only when an action runs.
+- `sync bitwarden` and `stop agent` matches.
+- install.sh warns when `rbw` is missing and reminds about GUI pinentry.
+
+### Known limitations
+- Password generator presets are approximated with rbw's flags: passphrase presets use `--diceware` (separator/capitalize/include_number ignored), numbers-only presets use `--only-numbers`, `special` maps to `--no-symbols`, and the uppercase/lowercase toggles are ignored.
+- Vault-state detection uses `rbw unlocked`, present in current rbw. Older rbw without that subcommand is reported as locked.
+
 ## [1.1.0] — 2026-05-13
 
 ### Added
